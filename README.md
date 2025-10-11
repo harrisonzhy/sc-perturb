@@ -30,6 +30,7 @@ Set `wandb` config for training visualization and logging. (Ensure to change the
 ```
 cd state
 bash set_wandb.sh
+cd ..
 ```
 Download the Replogle-Nadig training dataset:
 ```

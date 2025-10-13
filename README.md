@@ -7,7 +7,7 @@ salloc --mem=<nalloc>G --time=<time> -p mit_normal_gpu --gres=gpu:<ngpus>
 ```
 E.g.:
 ```
-salloc --mem=40G --time=02:00:00 -p mit_normal_gpu --gres=gpu:1
+salloc --mem=40G --time=06:00:00 -p mit_normal_gpu --gres=gpu:2
 ```
 
 Then run the environment setup script:

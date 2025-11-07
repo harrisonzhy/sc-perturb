@@ -23,3 +23,8 @@ To package submission for vcc, run the following, substituting the appropriate o
 uv tool run cell-eval prep -i ../competition/prediction.h5ad -g ../competition_support_set/gene_names.csv
 ```
 
+To transfer vcc file to local machine for submission, use `rsync`, e.g.:
+```
+rsync -avP zhanghy@orcd-login003.mit.edu:/orcd/home/002/zhanghy/orcd/scratch/zhanghy/sc-perturb/competition/prediction.prep.vcc ~/Downloads/
+```
+

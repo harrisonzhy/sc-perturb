@@ -1,0 +1,29 @@
+# Dataset paths - maps dataset names to their directories
+[datasets]
+
+#/orcd/home/002/zhanghy/sc-perturb/
+replogle_h1 = "/orcd/home/002/zhanghy/sc-perturb/competition_support_set/competition_train.h5"
+
+#replogle_h1 = "/orcd/home/002/zhanghy/sc-perturb/competition_support_set/{competition_train,k562_gwps,rpe1,jurkat,k562,hepg2}.h5"
+
+# Training specifications
+# All cell types in a dataset automatically go into training (excluding zeroshot/fewshot overrides)
+[training]
+replogle_h1 = "train"
+
+# Zeroshot specifications - entire cell types go to val or test
+[zeroshot]
+"replogle_h1.hepg2" = "test" # hold out entire hepg2 cell line
+#"replogle_h1.k562_gwps" = "test"
+#"replogle_h1.k562" = "test"
+#"replogle_h1.rpe1" = "test"
+#"replogle_h1.jurkat" = "test"
+
+# Fewshot specifications - explicit perturbation lists
+[fewshot]
+#[fewshot."replogle_h1.hepg2"] # hold out entire hepg2 cell line
+#[fewshot."replogle_h1.k562_gwps"]
+#[fewshot."replogle_h1.k562"]
+#[fewshot."replogle_h1.rpe1"]
+#[fewshot."replogle_h1.jurkat"]
+

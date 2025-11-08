@@ -1,11 +1,19 @@
 import h5py
 import numpy as np
 
-fil = "rpe1"
+import argparse
+from pathlib import Path
 
-path = f"/orcd/home/002/zhanghy/orcd/scratch/zhanghy/sc-perturb/competition_support_set/{fil}.h5"
-
-
+parser = argparse.ArgumentParser()
+parser.add_argument(
+        "-p", "--path",
+        required=True,
+        help="Path to the .h5 file (e.g., /path/to/file.h5)",
+    )
+args = parser.parse_args()
+path = Path(args.path).resolve()
+print(f"File path: {path}")
+        
 def open_h5py():
     with h5py.File(path, "r") as f:
         for k in f.keys():

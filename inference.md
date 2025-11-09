@@ -1,3 +1,15 @@
+### GRN inference
+To run scPRINT GRN inference, you must first download the model from HuggingFace:
+```
+python3 download_model.py
+```
+Next, you must also have an active `lamindb` instance. The script below should set it up automatically:
+```
+lamin settings set auto-connect false
+python3 grn_inference.py --input competition_support_set/competition_val_template.h5ad --num-genes 18080 --max-cells 200000
+```
+
+### Perturbation model inference
 Run inference using:
 ```
 cd state
@@ -8,13 +20,6 @@ uv run state tx infer \
 --adata "../competition_support_set/competition_val_template.h5ad" \ 
 --pert-col "target_gene"
 ```
-
-To run scPRINT GRN inference, you must first have an active `lamindb` instance. The script below should set it up:
-```
-lamin settings set auto-connect false
-python3 grn_inference.py --input competition_support_set/competition_val_template.h5ad --num-genes 18080 --max-cells 200000
-```
-
 To visualize the output h5ad file, run `visualize.py`:
 ```
 python3 visualize.py --path <output path above>

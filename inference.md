@@ -6,7 +6,7 @@ python3 download_model.py
 Next, you must also have an active `lamindb` instance. The script below should set it up automatically:
 ```
 lamin settings set auto-connect false
-python3 grn_inference.py --input competition_support_set/competition_val_template.h5ad --num-genes 18080 --max-cells 200000
+python3 grn_inference.py --input competition_support_set/competition_train.h5 --num-genes 18080 --max-cells 200000 --cell-type ARC_H1
 ```
 
 ### Perturbation model inference

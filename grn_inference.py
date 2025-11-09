@@ -37,7 +37,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 p = argparse.ArgumentParser()
 p.add_argument("--input", required=True, help="Path to .h5ad/.h5/.hdf5 or a dir containing one")
 p.add_argument("--outdir", default="grn_out")
-p.add_argument("--cell-type", default="H1-hESC")
+p.add_argument("--cell-type", default="ARC_H1")
 p.add_argument("--organism-id", default="NCBITaxon:9606")
 p.add_argument("--layer", default=None, help="AnnData layer; leave empty for .X")
 p.add_argument("--max-cells", type=int, default=200000)
@@ -77,9 +77,32 @@ def find_h5ad(pathlike: str | Path) -> Path:
             return cands[0]
     raise FileNotFoundError(f"No .h5ad found at {pth}")
 
-adata_path = find_h5ad(args.input)
+
+def find_h5_or_h5ad(pathlike: str) -> Path:
+    """Return a .h5ad or .h5 file at `pathlike`. If a directory is given,
+    prefer .h5ad over .h5."""
+    pth = Path(pathlike)
+    if pth.is_file():
+        if pth.suffix.lower() in {".h5ad", ".h5"}:
+            return pth
+        raise FileNotFoundError(f"Not an .h5ad/.h5 file: {pth}")
+
+    if pth.is_dir():
+        h5ad = sorted(pth.glob("*.h5ad"))
+        if h5ad:
+            return h5ad[0]
+        h5 = sorted(pth.glob("*.h5"))
+        if h5:
+            return h5[0]
+
+    raise FileNotFoundError(f"No .h5ad or .h5 found at {pth}")
+
+
+#adata_path = find_h5ad(args.input)
+adata_path = find_h5_or_h5ad(args.input)
 print("Reading:", adata_path)
 adata: ad.AnnData = ad.read_h5ad(adata_path)
+#adata: ad.AnnData = load_adata(adata_path)
 
 # ---------- harmonize obs & subset to H1 ----------
 if "organism_ontology_term_id" not in adata.obs.columns:
@@ -91,7 +114,7 @@ ct_col = "cell_type"
 if ct_col not in adata.obs.columns:
     raise RuntimeError(f"`{ct_col}` column not found in adata.obs")
 
-aliases = [args.cell_type, "H1", "H1 hESC", "H1_ESC", "H1-hESC (unperturbed)", "H1-hESC"]
+aliases = [args.cell_type, "H1", "ARC_H1", "H1 hESC", "H1_ESC", "H1-hESC (unperturbed)", "H1-hESC"]
 present = set(adata.obs[ct_col].astype(str).unique())
 chosen = next((ct for ct in aliases if ct in present), None)
 if chosen is None:
@@ -321,7 +344,7 @@ gn._adata_var_names = list(map(str, adata.var_names))
 print("Start inference...")
 try:
     with torch.no_grad():
-        edges_df = gn(ckpt, adata, cell_type="H1")
+        edges_df = gn(ckpt, adata, cell_type=args.cell_type)
 except RuntimeError as e:
     if "not attached to a Trainer" in str(e):
         warnings.warn(str(e))

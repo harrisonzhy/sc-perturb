@@ -9,6 +9,12 @@ uv run state tx infer \
 --pert-col "target_gene"
 ```
 
+To run scPRINT GRN inference, you must first have an active `lamindb` instance. The script below should set it up:
+```
+lamin settings set auto-connect false
+python3 grn_inference.py --input competition_support_set/competition_val_template.h5ad --num-genes 18080 --max-cells 200000
+```
+
 To visualize the output h5ad file, run `visualize.py`:
 ```
 python3 visualize.py --path <output path above>

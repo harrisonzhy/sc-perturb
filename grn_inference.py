@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# infer.py
-
 import argparse, os, sys, warnings
 from pathlib import Path
 
@@ -42,16 +39,15 @@ p.add_argument("--input", required=True, help="Path to .h5ad/.h5/.hdf5 or a dir 
 p.add_argument("--outdir", default="grn_out")
 p.add_argument("--cell-type", default="H1-hESC")
 p.add_argument("--organism-id", default="NCBITaxon:9606")
-p.add_argument("--layer", default=None, help="AnnData layer; use 'X' or leave empty for .X")
-p.add_argument("--max-cells", type=int, default=300)
-p.add_argument("--num-genes", type=int, default=3000)
-p.add_argument("--how", default="random expr")
+p.add_argument("--layer", default=None, help="AnnData layer; leave empty for .X")
+p.add_argument("--max-cells", type=int, default=200000)
+p.add_argument("--num-genes", type=int, default=18080)
+p.add_argument("--how", default="given")
 p.add_argument("--preprocess", default="softmax")
 p.add_argument("--head-agg", default="mean")
 p.add_argument("--filtration", default="none")
 p.add_argument("--forward-mode", default="none")
 p.add_argument("--ckpt-repo", default="jkobject/scPRINT")
-p.add_argument("--ckpt-file", default="v2-medium.ckpt")
 args = p.parse_args()
 
 # ---------- organism row present & normalized ----------
@@ -137,7 +133,7 @@ def load_model():
     model = scPrint.load_from_checkpoint(
         ckpt_path,
         precpt_gene_emb=None,
-        transformer="normal",
+        transformer="flash",
     )
     return model
 
@@ -157,18 +153,17 @@ except Exception:
 
 print("Organism in this instance:", bt.Organism.filter(ontology_id=OID).first() is not None)
 
-
 # --- normalize organism columns so scdataloader.load_genes() finds the record
 import pandas as pd
 import bionty as bt
-import scdataloader.utils as scu
-import scdataloader.collator as scc
+import scdataloader.utils as _scu
+import scdataloader.collator as _scc
 
 HUMAN_OID = "NCBITaxon:9606"
 MOUSE_OID = "NCBITaxon:10090"
 ADATA_FOR_GENES = adata  # fallback source
 
-_orig_load_genes = scc.load_genes
+_orig_load_genes = _scc.load_genes
 
 def _norm(s):
     s = str(s).strip().lower()
@@ -185,19 +180,17 @@ def load_genes_label_to_request(organisms):
     df.loc[canon == req_canon, "organism"] = req
     return df
 
-scc.load_genes = load_genes_label_to_request
+_scc.load_genes = load_genes_label_to_request
 # (optional, if some code calls utils.load_genes)
 try:
     import scdataloader.utils as scu
-    scu.load_genes = load_genes_label_to_request
+    _scu.load_genes = load_genes_label_to_request
 except Exception:
     pass
 
 # --- fix Collator._setup: treat empty valid_genes as None, guard start_idx ---
-_orig_setup = scc.Collator._setup
+_orig_setup = _scc.Collator._setup
 
-import scdataloader.utils as _scu
-import scdataloader.collator as _scc
 import scprint.tasks.grn as _grn
 
 # Build a gene table from the in-memory AnnData
@@ -228,82 +221,16 @@ def load_genes_from_adata_exact(organisms):
 _scu.load_genes = load_genes_from_adata_exact
 _scc.load_genes = load_genes_from_adata_exact
 
-# Safe Collator that ignores empty/zero-overlap valid_genes and never crashes on indexing
-class _SafeCollator(_scc.Collator):
-    def _setup(self, *args, **kwargs):
-        # Accept both call styles: (org_to_id, valid_genes, genelist) OR (genedf, org_to_id, valid_genes, genelist)
-        genedf = None; org_to_id = None; valid_genes = None; genelist = []
-        if len(args) == 3:
-            org_to_id, valid_genes, genelist = args
-        elif len(args) == 4:
-            genedf, org_to_id, valid_genes, genelist = args
-        else:
-            genedf      = kwargs.get("genedf", None)
-            org_to_id   = kwargs.get("org_to_id", None)
-            valid_genes = kwargs.get("valid_genes", None)
-            genelist    = kwargs.get("genelist", [])
-
-        # Always build from current AnnData; ignore provided genedf
-        genedf = load_genes_from_adata_exact(self.organisms).copy()
-        genedf.index = genedf.index.astype(str)
-        genedf["organism"] = genedf["organism"].astype(str)
-
-        # Normalize inputs
-        orgs = [str(o) for o in self.organisms]
-        org_to_id = org_to_id if isinstance(org_to_id, dict) else None
-
-        # Decide if we actually apply valid_genes (only if non-empty AND overlapping)
-        use_valid = None
-        if isinstance(valid_genes, (list, tuple, np.ndarray)) and len(valid_genes) > 0:
-            vg = [str(x) for x in valid_genes]
-            if len(set(vg) & set(genedf.index)) > 0:
-                use_valid = vg
-
-        tot = genedf if use_valid is None else genedf.loc[genedf.index.isin(use_valid)]
-
-        self.org_to_id = org_to_id
-        self.to_subset = {}
-        self.accepted_genes = {}
-        self.start_idx = {}
-        self.organism_ids = set(org_to_id[k] for k in orgs if org_to_id and k in org_to_id) or set(orgs)
-
-        for organism in orgs:
-            org_key = org_to_id[organism] if (org_to_id and organism in org_to_id) else organism
-
-            mask = (tot["organism"] == organism).values
-            idxs = np.where(mask)[0]
-            if idxs.size == 0:
-                # if filtering wiped this organism, fall back to unfiltered genedf
-                fallback = (genedf["organism"] == organism).values
-                if not fallback.any():
-                    raise RuntimeError(f"No genes for organism '{organism}' in synthesized table.")
-                self.start_idx[org_key] = int(np.where(fallback)[0][0])
-                ogenedf = genedf[genedf["organism"] == organism]
-                self.accepted_genes[org_key] = np.ones(len(ogenedf), dtype=bool)
-                if genelist:
-                    self.to_subset[org_key] = np.ones(len(ogenedf), dtype=bool)
-                continue
-
-            self.start_idx[org_key] = int(idxs[0])
-
-            ogenedf = genedf[genedf["organism"] == organism]
-            if use_valid is not None:
-                self.accepted_genes[org_key] = ogenedf.index.isin(use_valid).values
-            else:
-                self.accepted_genes[org_key] = np.ones(len(ogenedf), dtype=bool)
-
-            if genelist:
-                base = ogenedf if use_valid is None else ogenedf.loc[ogenedf.index.isin(use_valid)]
-                self.to_subset[org_key] = base.index.isin(genelist).values
+_RealCollator = _scc.Collator
+def Collator(*args, **kwargs):
+    # inject our final list; Collator supports 'genelist' (and often 'valid_genes')
+    kwargs["genelist"] = list(final_genes)
+    kwargs["valid_genes"] = list(final_genes)  # harmless if unused
+    return _RealCollator(*args, **kwargs)
 
 # Patch both modules so GNInfer uses this exact class
-_scc.Collator = _SafeCollator
-_grn.Collator = _SafeCollator
-
-# --- Patch GNInfer.save to fix var/GRN shape mismatch ---
-import numpy as np, pandas as pd, anndata as ad
-import scprint.tasks.grn as _grn
-
+_scc.Collator = Collator
+_grn.Collator = Collator
 
 def _save_edges_only(self, grn, subadata):
     # to numpy
@@ -341,26 +268,60 @@ def _save_edges_only(self, grn, subadata):
 
 _grn.GNInfer.save = _save_edges_only
 
+# --------- debug ---------
+import re
+import scdataloader.collator as scc
+import pandas as pd
+import re
+
+# normalize raw var names (strip Ensembl version suffixes)
+adata.var_names = adata.var_names.str.replace(r"\.\d+$", "", regex=True)
+adata.var_names_make_unique()
+
+# don't drop anything implicitly
+if hasattr(_scc, "drop"):
+    _scc.drop = set()
+
+# intersection = final gene list
+orgs = ["NCBITaxon:9606"]
+vocab_df = _scc.load_genes(orgs)
+vocab_ids = set(map(str, vocab_df.index))
+adata_ids = set(map(str, adata.var_names))
+final_genes = sorted(adata_ids & vocab_ids)       # this should be 18,080
+print("[metrics] num final genes:", len(final_genes))
+
+# Patch both modules so the call in scprint.tasks.grn uses our wrapper
+_scc.Collator = Collator
+_grn.Collator = Collator
+
 print("Create GNInfer...")
 gn = GNInfer(
     how=args.how,
+    genes=final_genes,
     preprocess=args.preprocess,
     head_agg=args.head_agg,
     filtration=args.filtration,
     forward_mode=args.forward_mode,
     num_genes=args.num_genes,
     max_cells=args.max_cells,
-    dtype=torch.float32,
+    dtype=torch.float16,
     doplot=False,
-    #layer="X",
 )
+
+# subset adata to exactly the usable genes and pin num_genes
+adata = adata[:, final_genes]
+if hasattr(gn, "num_genes"):
+    gn.num_genes = len(final_genes)
+    #gn.num_genes = len(adata)
+
 gn._model_genes = list(getattr(ckpt, "genes", []))
 gn._adata_var_names = list(map(str, adata.var_names))
 
 # ---------- run ----------
 print("Start inference...")
 try:
-    edges_df = gn(ckpt, adata, cell_type="H1")
+    with torch.no_grad():
+        edges_df = gn(ckpt, adata, cell_type="H1")
 except RuntimeError as e:
     if "not attached to a Trainer" in str(e):
         warnings.warn(str(e))
@@ -368,11 +329,14 @@ except RuntimeError as e:
     else:
         raise
 
+print(f"[metrics] realized rows: {len(edges_df):,}  (expected {len(final_genes)**2:,})")
+
+
 # ---------- save ----------
 outdir = Path(args.outdir)
 outdir.mkdir(parents=True, exist_ok=True)
-edges_path = outdir / "edges.csv"
+edges_path = outdir / "edges_all.csv"
 edges_df.to_csv(edges_path, index=False)
-print(f"→ saved: {edges_path}")
+print(f"Saved to: {edges_path}")
 print(edges_df.head(10))
 

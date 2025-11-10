@@ -1,0 +1,14 @@
+.vscode/
+hostfile
+__pycache__/
+vci_job_*
+lightning_logs/
+outputs/
+log/
+uv.lock
+tmp/
+notebooks/
+*.sif
+*.slurm
+temp
+wandb/

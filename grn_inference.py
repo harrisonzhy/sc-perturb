@@ -359,7 +359,8 @@ print(f"[metrics] realized rows: {len(edges_df):,}  (expected {len(final_genes)*
 outdir = Path(args.outdir)
 outdir.mkdir(parents=True, exist_ok=True)
 edges_path = outdir / "edges_all.csv"
-edges_df.to_csv(edges_path, index=False)
+edges_df.to_pickle(edges_path, compression="gzip")
+#edges_df.to_csv(edges_path, index=False)
 print(f"Saved to: {edges_path}")
 print(edges_df.head(10))
 

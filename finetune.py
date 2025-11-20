@@ -7,6 +7,7 @@ from scipy import sparse
 import torch
 import lightning.pytorch as pl
 from omegaconf import DictConfig, OmegaConf
+import mygene
 
 # STATE utilities (same entry points as _train.py)
 from cell_load.data_modules import PerturbationDataModule
@@ -55,18 +56,76 @@ def load_cfg_from_yaml(path: str):
     return cfg
 
 # ----------------- GRN utils -----------------
-def load_grn_laplacian(path: str) -> sparse.csr_matrix:
-    """Load GRN adjacency and return normalized Laplacian L (CSR)."""
+def load_grn_laplacian(
+    csv_path: str,
+    gene_order: list | None = None,
+    symmetric: str = "max",
+):
+    """
+    Build L = I - D^{-1/2} A D^{-1/2} from a CSV edgelist with header:
+        source,target,weight
+    If gene_order is provided (list of gene IDs), we align to that order
+    and drop any edges with genes not in the list. Otherwise we infer the
+    node set from the CSV and return the order we used.
+    """
+    import numpy as np
     import pandas as pd
-    A = sparse.csr_matrix(pd.read_csv(path, index_col=0).values.astype(np.float32))
-    A = A.maximum(A.T)  # symmetrize
-    deg = np.asarray(A.sum(axis=1)).ravel().astype(np.float32)
-    deg[deg == 0] = 1.0
-    invsqrt = 1.0 / np.sqrt(deg)
-    Dinv = sparse.diags(invsqrt)
-    L = sparse.eye(A.shape[0], dtype=np.float32) - (Dinv @ A @ Dinv)
-    return L.tocsr()
+    from scipy import sparse
 
+    df = pd.read_csv(csv_path)
+    if not {"source", "target"}.issubset(df.columns):
+        raise ValueError("CSV must have columns: source,target[,weight]")
+    if "weight" not in df.columns:
+        df["weight"] = 1.0
+
+    src = df["source"].astype(str)
+    dst = df["target"].astype(str)
+    w   = df["weight"].astype(np.float32).to_numpy()
+
+    if gene_order is None:
+        # infer node set from edges
+        cats = src.astype("category").cat.categories.union(
+            dst.astype("category").cat.categories
+        )
+        src = src.astype("category").cat.set_categories(cats)
+        dst = dst.astype("category").cat.set_categories(cats)
+        iu  = src.cat.codes.to_numpy()
+        iv  = dst.cat.codes.to_numpy()
+        index_to_gene = list(cats)
+        n = len(index_to_gene)
+    else:
+        # align to provided gene order
+        gene_to_index = {g: i for i, g in enumerate(gene_order)}
+        mask = src.isin(gene_to_index) & dst.isin(gene_to_index)
+        if not mask.any():
+            raise ValueError("After alignment, no GRN edges remain; check gene IDs.")
+        src = src[mask].map(gene_to_index)
+        dst = dst[mask].map(gene_to_index)
+        w   = w[mask.to_numpy()]
+        iu  = src.to_numpy(dtype=np.int64)
+        iv  = dst.to_numpy(dtype=np.int64)
+        index_to_gene = list(gene_order)
+        n = len(index_to_gene)
+
+    # build COO then coalesce duplicates by summing
+    A = sparse.coo_matrix((w, (iu, iv)), shape=(n, n), dtype=np.float32).tocsr()
+
+    # symmetrize
+    if symmetric == "max":
+        A = A.maximum(A.T)
+    elif symmetric == "sum":
+        A = A + A.T
+        A.setdiag(0.0)
+        A.eliminate_zeros()
+    else:
+        raise ValueError("symmetric must be 'max' or 'sum'")
+
+    # normalized Laplacian: L = I - D^{-1/2} A D^{-1/2}
+    deg = np.asarray(A.sum(axis=1)).ravel().astype(np.float32)
+    deg[deg == 0.0] = 1.0
+    Dinv = sparse.diags((1.0 / np.sqrt(deg)).astype(np.float32))
+    L = sparse.eye(n, dtype=np.float32) - (Dinv @ A @ Dinv)
+    return L.tocsr(), index_to_gene
 
 class GRNReg:
     """
@@ -179,8 +238,6 @@ def run(cfg: DictConfig):
             except Exception:
                 sentence_len = cfg["model"]["kwargs"]["transformer_backbone_kwargs"]["max_position_embeddings"]
 
-    # --- scGPT/CPA/SCVI tweaks omitted for brevity; copy from your _train.py if needed ---
-
     # --- datamodule ---
     data_module: PerturbationDataModule = get_datamodule(
         cfg["data"]["name"],
@@ -196,7 +253,7 @@ def run(cfg: DictConfig):
     data_module.setup(stage="fit")
     var_dims = data_module.get_var_dims()
 
-    # --- decoder_cfg (exactly like your file does) ---
+    # --- decoder_cfg ---
     if cfg["data"]["kwargs"]["output_space"] == "gene":
         gene_dim = var_dims.get("hvg_dim", 2000)
     else:
@@ -279,12 +336,12 @@ def run(cfg: DictConfig):
     trainer = pl.Trainer(**trainer_kwargs)
     print("Trainer built successfully")
 
-    # ------------------- checkpoint load (robust, like your _train.py) -------------------
-    checkpoint_path = os.path.join(ckpt_callbacks[0].dirpath, "last.ckpt")
-    print("Checkpoint path:", checkpoint_path)
-    if not os.path.exists(checkpoint_path):
-        checkpoint_path = None
-
+    # ------------------- checkpoint load -------------------
+    #checkpoint_path = os.path.join("zhanghy/orcd/scratch/zhanghy/sc-perturb", "last.ckpt")
+    #print("Checkpoint path:", checkpoint_path)
+    #if not os.path.exists(checkpoint_path):
+    #    checkpoint_path = None
+    checkpoint_path = None
     manual_init = cfg["model"]["kwargs"].get("init_from", None)
     if checkpoint_path is None and manual_init is not None:
         print(f"Loading manual checkpoint from {manual_init}")
@@ -331,10 +388,38 @@ def run(cfg: DictConfig):
     print(f"Trainable attention params: {sum(p.numel() for p in trainable):,}")
 
     if "grn" in cfg and cfg["grn"].get("path"):
-        L = load_grn_laplacian(cfg["grn"]["path"])
+
+        def gene_to_ensembl(gene_ids, species="human"):
+            mg = mygene.MyGeneInfo()
+            hits = mg.querymany(gene_ids,
+                        scopes="symbol,alias,old_symbol,ensembl.gene,ensembl.transcript",
+                        fields="ensembl.gene", species=species, as_dataframe=False)
+
+            manual = {
+                "dvl1": "ENSG00000107404",
+                "nbl1": "ENSG00000158747",
+                "al391650.1": "ENSG00000236782",
+                "trnp1": "ENSG00000253368",
+            }
+
+            out = []
+            for h in hits:
+                q = h.get("query")
+                e = h.get("ensembl")
+                gid = e[0]["gene"] if isinstance(e, list) else e.get("gene") if isinstance(e, dict) else None
+                gid = gid or manual.get(q.lower())
+                if not gid:
+                    raise ValueError(f"No Ensembl ID found for '{q}' (species='{species}')")
+                out.append(gid)
+            return out
+
+        ordering = gene_to_ensembl(data_module.get_var_names())
+        L, used_order = load_grn_laplacian(csv_path=cfg["grn"]["path"], gene_order=ordering)
         grn_reg = GRNReg(model, L, grn_lambda=float(cfg["grn"].get("lambda", 1e-3)))
     else:
         grn_reg = None
+
+    print("Done loading grn reg")
 
     # Wrap training_step to add GRN term (no edits to model class)
     orig_training_step = model.training_step
@@ -358,7 +443,7 @@ def run(cfg: DictConfig):
     model.configure_optimizers = lambda: optimizer
 
     # ------------------- train -------------------
-    print("Starting trainer.fit()…")
+    print("Starting trainer.fit()...")
     trainer.fit(model, datamodule=data_module, ckpt_path=checkpoint_path)
     print("trainer.fit() done.")
 

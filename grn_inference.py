@@ -123,7 +123,7 @@ if chosen is None:
     raise RuntimeError(f"Couldn’t find an H1-like cell_type. Seen: {sorted(list(present))[:12]}")
 
 print("Subsetting to H1 cell line:", chosen)
-adata = adata[adata.obs[ct_col] == chosen].copy()
+adata = adata[adata.obs[ct_col] == chosen]
 
 # --- choose layer ---
 layer = args.layer
@@ -141,12 +141,12 @@ if not isinstance(X, np.ndarray):
 
 gene_var = X.sum(axis=0)
 keep_idx = np.argsort(gene_var)[::-1][: min(args.num_genes, X.shape[1])]
-adata = adata[:, keep_idx].copy()
+adata = adata[:, keep_idx]
 
 # cell downsample
 if adata.n_obs > args.max_cells:
     sel = np.random.RandomState(0).choice(adata.n_obs, args.max_cells, replace=False)
-    adata = adata[sel].copy()
+    adata = adata[sel]
 
 print("adata_prep_obs:", adata.obs.columns)
 
@@ -348,7 +348,7 @@ try:
 except RuntimeError as e:
     if "not attached to a Trainer" in str(e):
         warnings.warn(str(e))
-        edges_df = gn(ckpt, adata)
+        edges_df = gn(ckpt, adata, cell_type=args.cell_type)
     else:
         raise
 

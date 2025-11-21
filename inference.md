@@ -39,3 +39,18 @@ To transfer vcc file to local machine for submission, use `rsync`, e.g.:
 rsync -avP zhanghy@orcd-login003.mit.edu:/orcd/home/002/zhanghy/orcd/scratch/zhanghy/sc-perturb/competition/prediction.prep.vcc ~/Downloads/
 ```
 
+### Evaluation
+Run evaluation, e.g. for the fine-tuned model for 300 iterations, by first packaging results into a `vcc` file:
+```
+uv tool run cell-eval prep \
+  -i ft-out/prediction.h5ad \
+  -g /home/zhanghy/orcd/scratch/zhanghy/sc-perturb/competition_support_set/gene_names.csv \
+  -o ft-out/prediction.prep.vcc
+```
+Then, run scoring locally:
+```
+uv tool run cell-eval score \
+  -i ft-out/prediction.prep.vcc \
+  -I /home/zhanghy/orcd/scratch/zhanghy/sc-perturb/competition_support_set/competition_val_template.h5ad -o ft-out/cell-eval-outdir
+```
+

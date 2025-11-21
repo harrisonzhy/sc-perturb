@@ -1,10 +1,17 @@
-#!/usr/bin/env python3
+import io
 import argparse as ap
-import os, math
-import numpy as np
+import os, math, sys, warnings
 from scipy import sparse
+from pathlib import Path
 
+import contextlib
+from tqdm import tqdm
+
+import anndata as ad
+import numpy as np
+import pandas as pd
 import torch
+
 import lightning.pytorch as pl
 from omegaconf import DictConfig, OmegaConf
 import mygene
@@ -23,6 +30,7 @@ from state.tx.callbacks import (
 )
 from state.tx.utils import get_checkpoint_callbacks, get_lightning_module, get_loggers
 
+from contextlib import redirect_stdout
 
 def load_cfg_from_yaml(path: str):
     if not os.path.exists(path):
@@ -64,11 +72,14 @@ def load_grn_laplacian(
     """
     Build L = I - D^{-1/2} A D^{-1/2} from a CSV edgelist with header:
         source,target,weight
-    If gene_order is provided (list of gene IDs), we align to that order
-    and drop any edges with genes not in the list. Otherwise we infer the
-    node set from the CSV and return the order we used.
+    If gene_order is provided, we first drop any edges with genes not in that list,
+    then build the Laplacian ONLY over the subset of genes that actually appear in
+    at least one remaining edge (so isolated genes are not penalized).
+    Returns:
+        (L, used_order)
+        - L: scipy.sparse.csr_matrix or None if no usable edges remain
+        - used_order: list[str] of genes corresponding to L's row/col order
     """
-    import numpy as np
     import pandas as pd
     from scipy import sparse
 
@@ -83,7 +94,7 @@ def load_grn_laplacian(
     w   = df["weight"].astype(np.float32).to_numpy()
 
     if gene_order is None:
-        # infer node set from edges
+        # infer node set from edges (all genes with edges will be in the graph)
         cats = src.astype("category").cat.categories.union(
             dst.astype("category").cat.categories
         )
@@ -91,23 +102,38 @@ def load_grn_laplacian(
         dst = dst.astype("category").cat.set_categories(cats)
         iu  = src.cat.codes.to_numpy()
         iv  = dst.cat.codes.to_numpy()
-        index_to_gene = list(cats)
-        n = len(index_to_gene)
+        used_order = list(cats)
+        n = len(used_order)
+        if n == 0:
+            return None, []
     else:
-        # align to provided gene order
-        gene_to_index = {g: i for i, g in enumerate(gene_order)}
-        mask = src.isin(gene_to_index) & dst.isin(gene_to_index)
+        # keep only edges fully inside gene_order
+        gene_order = list(map(str, gene_order))
+        gene_set = set(gene_order)
+        mask = src.isin(gene_set) & dst.isin(gene_set)
+
         if not mask.any():
-            raise ValueError("After alignment, no GRN edges remain; check gene IDs.")
-        src = src[mask].map(gene_to_index)
-        dst = dst[mask].map(gene_to_index)
-        w   = w[mask.to_numpy()]
-        iu  = src.to_numpy(dtype=np.int64)
-        iv  = dst.to_numpy(dtype=np.int64)
-        index_to_gene = list(gene_order)
-        n = len(index_to_gene)
+            # nothing to penalize
+            return None, []
+
+        src_kept = src[mask]
+        dst_kept = dst[mask]
+        w        = w[mask.to_numpy()]
+
+        # subset of genes that actually appear in (src_kept, dst_kept), preserving gene_order order
+        used_set = set(src_kept) | set(dst_kept)
+        used_order = [g for g in gene_order if g in used_set]
+
+        # map to compact indices
+        gene_to_index = {g: i for i, g in enumerate(used_order)}
+        iu = src_kept.map(gene_to_index).to_numpy(dtype=np.int64)
+        iv = dst_kept.map(gene_to_index).to_numpy(dtype=np.int64)
+        n = len(used_order)
+        if n == 0:
+            return None, []
 
     # build COO then coalesce duplicates by summing
+    from scipy import sparse
     A = sparse.coo_matrix((w, (iu, iv)), shape=(n, n), dtype=np.float32).tocsr()
 
     # symmetrize
@@ -122,54 +148,43 @@ def load_grn_laplacian(
 
     # normalized Laplacian: L = I - D^{-1/2} A D^{-1/2}
     deg = np.asarray(A.sum(axis=1)).ravel().astype(np.float32)
+    if n == 0 or (deg == 0).all():
+        return None, []
     deg[deg == 0.0] = 1.0
     Dinv = sparse.diags((1.0 / np.sqrt(deg)).astype(np.float32))
     L = sparse.eye(n, dtype=np.float32) - (Dinv @ A @ Dinv)
-    return L.tocsr(), index_to_gene
+    return L.tocsr(), used_order
 
 class GRNReg:
-    """
-    GRN regularizer: for each Q/K Linear, compute tr(F^T L F) with
-    F ≈ (P^T @ W^T), where P is a fixed random projection (genes←latent-in).
-    """
-    def __init__(self, module: torch.nn.Module, L_csr: sparse.csr_matrix, grn_lambda: float = 1e-3, seed: int = 0):
+    def __init__(self, module, L_csr, grn_lambda=1e-3, seed=0):
         self.module = module
         self.grn_lambda = float(grn_lambda)
-        self.L_shape = L_csr.shape
         idx = np.vstack(L_csr.nonzero()).astype(np.int64)
-        self.L_indices_cpu = torch.tensor(idx)
-        self.L_values_cpu = torch.tensor(L_csr.data, dtype=torch.float32)
-        self._proj_cache = None
+        self.I = torch.tensor(idx)                              # [2, nnz]
+        self.V = torch.tensor(L_csr.data, dtype=torch.float32)  # [nnz]
+        self.shape = L_csr.shape
+        self._proj = None
         self._seed = seed
 
-    def _projection(self, device: torch.device, in_dim: int) -> torch.Tensor:
-        if self._proj_cache is None or self._proj_cache.shape[0] != in_dim:
-            g = torch.Generator(device=device)
-            g.manual_seed(self._seed)
-            self._proj_cache = torch.randn(in_dim, self.L_shape[0], generator=g, device=device) / math.sqrt(in_dim)
-        return self._proj_cache  # [in_dim, N_genes]
+    def _P(self, device, in_dim, n_genes):
+        if self._proj is None or self._proj.shape != (in_dim, n_genes) or self._proj.device != device:
+            g = torch.Generator(device=device); g.manual_seed(self._seed)
+            self._proj = torch.randn(in_dim, n_genes, generator=g, device=device) / math.sqrt(in_dim)
+        return self._proj
 
-    def penalty(self, device: torch.device) -> torch.Tensor:
-        if self.grn_lambda <= 0:
+    def penalty(self, device):
+        if self.grn_lambda <= 0: 
             return torch.tensor(0.0, device=device)
-
-        L = torch.sparse_coo_tensor(
-            self.L_indices_cpu.to(device), self.L_values_cpu.to(device), self.L_shape, device=device
-        )
-
+        L = torch.sparse_coo_tensor(self.I.to(device), self.V.to(device), self.shape, device=device)
         total = torch.tensor(0.0, device=device)
         for m in self.module.modules():
             if hasattr(m, "q_proj") and hasattr(m, "k_proj"):
-                for W in (m.q_proj, m.k_proj):  # only Q/K
-                    # W.weight: [out_dim, in_dim]
-                    in_dim = W.weight.shape[1]
-                    P = self._projection(device, in_dim)   # [in_dim, N]
-                    F = (P.T @ W.weight.T)                 # [N, out_dim]
-                    LF = torch.sparse.mm(L, F)             # [N, out_dim]
+                for W in (m.q_proj, m.k_proj):  # [out_dim, in_dim]
+                    P = self._P(device, W.weight.shape[1], self.shape[0])   # [in_dim, n_genes]
+                    F = P.T @ W.weight.T                                    # [n_genes, out_dim]
+                    LF = torch.sparse.mm(L, F)                               # [n_genes, out_dim]
                     total = total + (F * LF).sum()
-
         return self.grn_lambda * total
-
 
 # -------------- fine-tune helpers --------------
 def freeze_all_but_attention(root: torch.nn.Module):
@@ -387,41 +402,83 @@ def run(cfg: DictConfig):
     trainable = freeze_all_but_attention(model)
     print(f"Trainable attention params: {sum(p.numel() for p in trainable):,}")
 
+    import re, mygene
+   
+    def gene_to_ensembl(gene_ids, species="human", batch_size=1000, progress=True):
+        """
+        Map a list of gene symbols to Ensembl gene IDs using MyGeneInfo.
+
+        Returns:
+            ens_list: list[str | None]  # same length as gene_ids, unmapped = None
+            mapped_idx: list[int]       # indices of successfully mapped genes
+        """
+        mg = mygene.MyGeneInfo()
+        cleaned = [str(g) for g in gene_ids]
+
+        pbar = tqdm(total=len(cleaned), desc="Querying MyGeneInfo", unit="gene") if progress else None
+        results = []
+
+        # Batch queries
+        for i in range(0, len(cleaned), batch_size):
+            batch = cleaned[i : i + batch_size]
+            hits = mg.querymany(
+                batch,
+                scopes="symbol,alias,old_symbol,entrezgene",
+                fields="ensembl.gene",
+                species=species,
+                as_dataframe=False
+            )
+            results.extend(hits or [])
+            if pbar:
+                pbar.update(len(batch))
+
+        if pbar:
+            pbar.close()
+
+        # Group results by query string
+        grouped = {}
+        for h in results:
+            q = h.get("query")
+            if q is not None:
+                grouped.setdefault(q, []).append(h)
+
+        def extract_ensembl_id(h):
+            e = h.get("ensembl")
+            if isinstance(e, list) and e:
+                return e[0].get("gene")
+            if isinstance(e, dict):
+                return e.get("gene")
+            return None
+
+        ens_list = []
+        mapped_idx = []
+
+        # Build outputs
+        for i, g in enumerate(cleaned):
+            rows = grouped.get(g, [])
+            eid = None
+            for r in rows:
+                eid = extract_ensembl_id(r)
+                if eid:
+                    break
+            ens_list.append(eid)
+            if eid:
+                mapped_idx.append(i)
+
+        return ens_list, mapped_idx
+
     if "grn" in cfg and cfg["grn"].get("path"):
-
-        def gene_to_ensembl(gene_ids, species="human"):
-            mg = mygene.MyGeneInfo()
-            hits = mg.querymany(gene_ids,
-                        scopes="symbol,alias,old_symbol,ensembl.gene,ensembl.transcript",
-                        fields="ensembl.gene", species=species, as_dataframe=False)
-
-            manual = {
-                "dvl1": "ENSG00000107404",
-                "nbl1": "ENSG00000158747",
-                "al391650.1": "ENSG00000236782",
-                "trnp1": "ENSG00000253368",
-            }
-
-            out = []
-            for h in hits:
-                q = h.get("query")
-                e = h.get("ensembl")
-                gid = e[0]["gene"] if isinstance(e, list) else e.get("gene") if isinstance(e, dict) else None
-                gid = gid or manual.get(q.lower())
-                if not gid:
-                    raise ValueError(f"No Ensembl ID found for '{q}' (species='{species}')")
-                out.append(gid)
-            return out
-
-        ordering = gene_to_ensembl(data_module.get_var_names())
-        L, used_order = load_grn_laplacian(csv_path=cfg["grn"]["path"], gene_order=ordering)
+        ens_list, mapped_idx = gene_to_ensembl(data_module.get_var_names())
+        ens_mapped = [ens_list[i] for i in mapped_idx]
+        print("Load GRN and compute Laplacian")
+        L, used_order = load_grn_laplacian(csv_path=cfg["grn"]["path"], gene_order=ens_mapped)
+        print("Load GRN regularizer")
         grn_reg = GRNReg(model, L, grn_lambda=float(cfg["grn"].get("lambda", 1e-3)))
     else:
         grn_reg = None
 
-    print("Done loading grn reg")
-
-    # Wrap training_step to add GRN term (no edits to model class)
+    print("Set up training")
+    # Wrap training_step to add GRN term
     orig_training_step = model.training_step
     def training_step_with_grn(*args, **kwargs):
         out = orig_training_step(*args, **kwargs)

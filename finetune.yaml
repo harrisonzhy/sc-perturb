@@ -82,8 +82,8 @@ training:
   batch_size: 1
   lr: 2e-5
   weight_decay: 0.01
-  max_steps: 5000
-  val_freq: 200
+  max_steps: 1000
+  val_freq: 50
   train_seed: 1337
   gradient_clip_val: 1.0
   devices: 1

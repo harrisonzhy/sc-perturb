@@ -49,8 +49,13 @@ uv tool run cell-eval prep \
 ```
 Then, run scoring locally:
 ```
-uv tool run cell-eval score \
-  -i ft-out/prediction.prep.vcc \
-  -I /home/zhanghy/orcd/scratch/zhanghy/sc-perturb/competition_support_set/competition_val_template.h5ad -o ft-out/cell-eval-outdir
+uv tool run cell-eval run \
+  --num-threads 32
+  --adata-pred ft-out/prediction.h5ad \
+  --adata-real /home/zhanghy/orcd/scratch/zhanghy/sc-perturb/competition_support_set/competition_val_template.h5ad \
+  --de-real H1_real_de.csv \
+  --control-pert non-targeting \
+  --pert-col target_gene \
+  --celltype-col cell_type \
+  -o ft-out/cell-eval-outdir
 ```
-

@@ -37,36 +37,19 @@ def load_cfg_from_yaml(path: str):
         raise FileNotFoundError(f"Config YAML not found: {path}")
     cfg = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
 
-    # minimal validation + defaults
+    # Check hparams are specified
     for top in ["output_dir", "name", "data", "model", "training"]:
         if top not in cfg:
             raise KeyError(f"Missing required top-level key: {top}")
-    cfg.setdefault("overwrite", False)
-    cfg.setdefault("use_wandb", False)
-    cfg.setdefault("wandb", {"project": "", "entity": "", "local_wandb_dir": "./wandb"})
-    cfg["data"].setdefault("kwargs", {})
-    cfg["model"].setdefault("kwargs", {})
-    cfg["training"].setdefault("batch_size", 1)
-    cfg["training"].setdefault("max_steps", 2000)
-    cfg["training"].setdefault("val_freq", 200)
-    cfg["training"].setdefault("train_seed", 1337)
-    cfg["training"].setdefault("gradient_clip_val", 1.0)
-    cfg["training"].setdefault("devices", 1)
-    cfg["training"].setdefault("strategy", "auto")
-    cfg.setdefault("grn", {"path": None, "lambda": 1e-3})
 
-    # sanity: checkpoint path should be a .ckpt
     init_from = cfg["model"]["kwargs"].get("init_from")
-    if init_from and not init_from.endswith(".ckpt"):
-        print(f"[warn] model.kwargs.init_from='{init_from}' does not look like a .ckpt")
-
     os.makedirs(cfg["output_dir"], exist_ok=True)
     return cfg
 
 # ----------------- GRN utils -----------------
 def load_grn_laplacian(
     csv_path: str,
-    gene_order: list | None = None,
+    gene_order: list[str],
     symmetric: str = "max",
 ):
     """
@@ -87,50 +70,39 @@ def load_grn_laplacian(
     if not {"source", "target"}.issubset(df.columns):
         raise ValueError("CSV must have columns: source,target[,weight]")
     if "weight" not in df.columns:
+        print("[WARN] Could not find column 'weight', setting all to 1.0")
         df["weight"] = 1.0
 
     src = df["source"].astype(str)
     dst = df["target"].astype(str)
     w   = df["weight"].astype(np.float32).to_numpy()
 
-    if gene_order is None:
-        # infer node set from edges (all genes with edges will be in the graph)
-        cats = src.astype("category").cat.categories.union(
-            dst.astype("category").cat.categories
-        )
-        src = src.astype("category").cat.set_categories(cats)
-        dst = dst.astype("category").cat.set_categories(cats)
-        iu  = src.cat.codes.to_numpy()
-        iv  = dst.cat.codes.to_numpy()
-        used_order = list(cats)
-        n = len(used_order)
-        if n == 0:
-            return None, []
-    else:
-        # keep only edges fully inside gene_order
-        gene_order = list(map(str, gene_order))
-        gene_set = set(gene_order)
-        mask = src.isin(gene_set) & dst.isin(gene_set)
+    # keep only edges fully inside gene_order
+    gene_set = set(gene_order)
+    mask = src.isin(gene_set) & dst.isin(gene_set)
 
-        if not mask.any():
-            # nothing to penalize
-            return None, []
+    if not mask.any():
+        print("[WARN] Nothing to penalize")
+        return None, []
 
-        src_kept = src[mask]
-        dst_kept = dst[mask]
-        w        = w[mask.to_numpy()]
+    src_kept = src[mask]
+    dst_kept = dst[mask]
+    w = w[mask.to_numpy()]
 
-        # subset of genes that actually appear in (src_kept, dst_kept), preserving gene_order order
-        used_set = set(src_kept) | set(dst_kept)
-        used_order = [g for g in gene_order if g in used_set]
+    # subset of genes that actually appear in (src_kept, dst_kept), preserving gene_order order
+    used_set = set(src_kept) | set(dst_kept)
+    used_order = [g for g in gene_order if g in used_set]
 
-        # map to compact indices
-        gene_to_index = {g: i for i, g in enumerate(used_order)}
-        iu = src_kept.map(gene_to_index).to_numpy(dtype=np.int64)
-        iv = dst_kept.map(gene_to_index).to_numpy(dtype=np.int64)
-        n = len(used_order)
-        if n == 0:
-            return None, []
+    # map to compact indices
+    gene_to_index = {g: i for i, g in enumerate(used_order)}
+    iu = src_kept.map(gene_to_index).to_numpy(dtype=np.int64)
+    iv = dst_kept.map(gene_to_index).to_numpy(dtype=np.int64)
+    n = len(used_order)
+
+    print(f"Laplacian has shape ({n}, {n})")
+
+    if n == 0:
+        return None, []
 
     # build COO then coalesce duplicates by summing
     from scipy import sparse
@@ -139,20 +111,17 @@ def load_grn_laplacian(
     # symmetrize
     if symmetric == "max":
         A = A.maximum(A.T)
-    elif symmetric == "sum":
-        A = A + A.T
-        A.setdiag(0.0)
-        A.eliminate_zeros()
     else:
-        raise ValueError("symmetric must be 'max' or 'sum'")
+        raise ValueError("symmetric must be 'max'")
 
     # normalized Laplacian: L = I - D^{-1/2} A D^{-1/2}
     deg = np.asarray(A.sum(axis=1)).ravel().astype(np.float32)
     if n == 0 or (deg == 0).all():
         return None, []
-    deg[deg == 0.0] = 1.0
     Dinv = sparse.diags((1.0 / np.sqrt(deg)).astype(np.float32))
     L = sparse.eye(n, dtype=np.float32) - (Dinv @ A @ Dinv)
+
+    print("Finished computing full Laplacian")
     return L.tocsr(), used_order
 
 class GRNReg:

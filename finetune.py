@@ -205,94 +205,56 @@ class GRNReg:
 
 # -------------- fine-tune helpers --------------
 import torch
-from torch import nn
 
-
-def freeze_all_but_last_n_layers(root: torch.nn.Module, n_layers: int):
+def freeze_all_but_last_n_layers(model: torch.nn.Module, n_layers: int):
     """
-    Freeze all parameters except those in the last `n_layers`
-    transformer decoder blocks in `root.transformer_backbone.layers`.
+    Freeze everything, then unfreeze:
+      - model.pert_encoder
+      - the last n_layers of model.transformer_backbone.layers
 
-    Within each selected block, unfreeze:
-      - self_attn.{q_proj,k_proj,v_proj,o_proj}
-      - mlp (all params)
-      - norm modules inside the block (LlamaRMSNorm / LayerNorm)
-
-    Returns:
-        List[nn.Parameter]: the list of trainable parameters.
+    Return: list of trainable parameters.
     """
-    # 1) Freeze transformer backbone and basal encoder
-    for p in root.transformer_backbone.parameters():
+
+    # 1) Freeze everything
+    for p in model.parameters():
         p.requires_grad = False
-    for p in root.basal_encoder.parameters():
-        p.requires_grad = False
-
-    # 2) Get the transformer layers explicitly
-    if not hasattr(root, "transformer_backbone"):
-        raise ValueError("Model has no attribute 'transformer_backbone'")
-
-    backbone = root.transformer_backbone
-
-    if not hasattr(backbone, "layers"):
-        raise ValueError("transformer_backbone has no attribute 'layers'")
-
-    blocks = list(backbone.layers)
-    if len(blocks) == 0:
-        print("[WARN] No transformer blocks found in transformer_backbone.layers")
-        return []
-
-    if n_layers <= 0:
-        print("[WARN] n_layers <= 0, all parameters remain frozen")
-        return []
-
-    # 3) Pick last n_layers blocks (clip if n_layers > #blocks)
-    n_layers = min(n_layers, len(blocks))
-    blocks_to_train = blocks[-n_layers:]
 
     trainable = []
 
-    num_attn = 0
-    num_mlp = 0
-    num_norm = 0
+    # 2) Unfreeze pert_encoder
+    if hasattr(model, "pert_encoder"):
+        for p in model.pert_encoder.parameters():
+            p.requires_grad = True
+            trainable.append(p)
+    else:
+        print("[WARN] model has no `pert_encoder`")
+
+    # 3) Unfreeze last n_layers of transformer backbone
+    if not hasattr(model, "transformer_backbone"):
+        raise ValueError("Model has no attribute `transformer_backbone`")
+
+    blocks = list(model.transformer_backbone.layers)
+    if len(blocks) == 0:
+        print("[WARN] No transformer blocks found.")
+        return trainable
+
+    if n_layers <= 0:
+        print("[WARN] n_layers <= 0 (only pert_encoder trainable).")
+        return trainable
+
+    n_layers = min(n_layers, len(blocks))
+    blocks_to_train = blocks[-n_layers:]
 
     for block in blocks_to_train:
-        # ---- attention projections ----
-        if hasattr(block, "self_attn"):
-            attn = block.self_attn
-            for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                if hasattr(attn, name):
-                    mod = getattr(attn, name)
-                    for p in mod.parameters():
-                        p.requires_grad = True
-                        trainable.append(p)
-                        num_attn += 1
+        for p in block.parameters():
+            p.requires_grad = True
+            trainable.append(p)
 
-        # ---- MLP / feed-forward ----
-        if hasattr(block, "mlp"):
-            for p in block.mlp.parameters():
-                p.requires_grad = True
-                trainable.append(p)
-                num_mlp += 1
+    print(f"Trainable: pert_encoder + last {n_layers} transformer layer(s)")
+    print(f"Total trainable parameter tensors: {len(trainable)}")
 
-        # ---- Norms inside the block (RMSNorm / LayerNorm) ----
-        for sub in block.modules():
-            cls_name = sub.__class__.__name__
-            if isinstance(sub, torch.nn.LayerNorm) or cls_name in ("LlamaRMSNorm", "RMSNorm"):
-                for p in sub.parameters():
-                    p.requires_grad = True
-                    trainable.append(p)
-                    num_norm += 1
-    
-    for p in root.basal_encoder.parameters():
-        p.requires_grad = False
-
-    print("Trainable parameter counts:")
-    print(f"Attention: {num_attn}, MLP: {num_mlp}, Norm: {num_norm}")
-
-    if not trainable:
-        print("[WARN] No trainable parameters found in selected blocks")
-    
     return trainable
+
 
 # -------------- run training --------------
 def run(cfg: DictConfig):
@@ -381,7 +343,7 @@ def run(cfg: DictConfig):
         cfg["training"],
         var_dims,
     )
-    print(f"Model params ≈ {sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**3:.2f} GB")
+    print(f"Model params is about {sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**3:.2f} GB")
 
     # --- loggers / callbacks (same style) ---
     loggers = get_loggers(
@@ -443,54 +405,12 @@ def run(cfg: DictConfig):
     print("Trainer built successfully")
 
     # ------------------- checkpoint load -------------------
-    #checkpoint_path = os.path.join("zhanghy/orcd/scratch/zhanghy/sc-perturb", "last.ckpt")
-    #print("Checkpoint path:", checkpoint_path)
-    #if not os.path.exists(checkpoint_path):
-    #    checkpoint_path = None
-    checkpoint_path = None
-    manual_init = cfg["model"]["kwargs"].get("init_from", None)
-    if checkpoint_path is None and manual_init is not None:
-        print(f"Loading manual checkpoint from {manual_init}")
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        checkpoint = torch.load(manual_init, map_location=device, weights_only=False)
-        model_state = model.state_dict()
-        checkpoint_state = checkpoint["state_dict"]
-
-        # Handle output_space change by rebuilding decoder
-        ckpt_output_space = checkpoint.get("hyper_parameters", {}).get("output_space", "gene")
-        cur_output_space = cfg["data"]["kwargs"]["output_space"]
-        if ckpt_output_space != cur_output_space:
-            print(f"Output space mismatch: ckpt='{ckpt_output_space}' vs current='{cur_output_space}'. Rebuilding decoder.")
-            if cfg["model"]["kwargs"].get("gene_decoder_bool", True) is not False:
-                model.decoder_cfg = decoder_cfg
-                model._build_decoder()
-                model._decoder_externally_configured = True
-                print(f"New decoder: output_space='{cur_output_space}', gene_dim={decoder_cfg['gene_dim']}")
-
-        # Pert encoder input-dim mismatch → rebuild
-        pert_key = "pert_encoder.0.weight"
-        if pert_key in checkpoint_state:
-            ckpt_pert_dim = checkpoint_state[pert_key].shape[1]
-            if hasattr(model, "pert_dim") and ckpt_pert_dim != model.pert_dim:
-                from state.tx.models.utils import build_mlp
-                model.pert_encoder = build_mlp(
-                    in_dim=model.pert_dim,
-                    out_dim=model.hidden_dim,
-                    hidden_dim=model.hidden_dim,
-                    n_layers=model.n_encoder_layers,
-                    dropout=model.dropout,
-                    activation=model.activation_class,
-                )
-                print(f"Rebuilt pert_encoder: model.pert_dim={model.pert_dim}, ckpt expects {ckpt_pert_dim}")
-
-        # Shape-filtered load
-        filtered = {k: v for k, v in checkpoint_state.items() if k in model_state and v.shape == model_state[k].shape}
-        missing, unexpected = model.load_state_dict(filtered, strict=False)
-        print(f"Loaded checkpoint with shape filtering: missing={len(missing)}, unexpected={len(unexpected)}")
-        ckpt_path = None  # start training fresh from the loaded weights
+    manual_init = cfg["model"]["kwargs"]["transformer_backbone_kwargs"].get("init_from", None)
+    checkpoint = torch.load(manual_init, map_location="cpu", weights_only=False)
+    model.load_state_dict(checkpoint["state_dict"], strict=True)
 
     # ------------------- freeze last n layers + GRN loss -------------------
-    trainable = freeze_all_but_last_n_layers(root=model, n_layers=2)
+    trainable = freeze_all_but_last_n_layers(model=model, n_layers=2)
     print(f"Trainable params: {sum(p.numel() for p in trainable):,}")
     print_full_model(root=model)
 
@@ -535,7 +455,7 @@ def run(cfg: DictConfig):
 
     # ------------------- train -------------------
     print("Starting trainer.fit()...")
-    trainer.fit(model, datamodule=data_module, ckpt_path=checkpoint_path)
+    trainer.fit(model, datamodule=data_module, ckpt_path=None)
     print("trainer.fit() done.")
 
     # Save final checkpoint if not already present

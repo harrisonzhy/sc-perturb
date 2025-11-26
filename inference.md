@@ -40,7 +40,16 @@ rsync -avP zhanghy@orcd-login003.mit.edu:/orcd/home/002/zhanghy/orcd/scratch/zha
 ```
 
 ### Evaluation
-Run evaluation, e.g. for the fine-tuned model for 300 iterations, by first packaging results into a `vcc` file:
+Run evaluation, e.g. for the fine-tuned model for 300 iterations, by first running inference to generate predictions:
+```
+uv run --active state tx infer \
+  --output "/home/zhanghy/orcd/scratch/zhanghy/sc-perturb/ft-out/prediction.h5ad" \
+  --model-dir "/home/zhanghy/orcd/scratch/zhanghy/sc-perturb/ft-out/ft_attn_grn" \
+  --checkpoint "/home/zhanghy/orcd/scratch/zhanghy/sc-perturb/ft-out/ft_attn_grn/checkpoints/step=200.ckpt" \
+  --adata "/home/zhanghy/orcd/scratch/zhanghy/sc-perturb/competition_support_set/competition_val_template.h5ad" \
+  --pert-col target_gene
+```
+Then package results into a `vcc` file:
 ```
 uv tool run cell-eval prep \
   -i ft-out/prediction.h5ad \
@@ -50,10 +59,10 @@ uv tool run cell-eval prep \
 Then, run scoring locally:
 ```
 uv tool run cell-eval run \
-  --num-threads 32
+  --num-threads 16 \
   --adata-pred ft-out/prediction.h5ad \
   --adata-real /home/zhanghy/orcd/scratch/zhanghy/sc-perturb/competition_support_set/competition_val_template.h5ad \
-  --de-real H1_real_de.csv \
+  --de-real ft-v1/H1_real_de.csv \
   --control-pert non-targeting \
   --pert-col target_gene \
   --celltype-col cell_type \

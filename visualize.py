@@ -20,6 +20,7 @@ def main():
     print(f"Variables (var): {list(adata.var.columns)}")
     print(f"Obsm keys: {list(adata.obsm.keys())}")
     print(f"Layers: {list(adata.layers.keys()) if hasattr(adata, 'layers') else 'None'}")
+    print("min:", adata.X.min(), "max:", adata.X.max())
 
     # Show head of obs and var
     print("\n=== adata.obs (first 5 rows) ===")

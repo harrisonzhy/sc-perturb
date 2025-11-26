@@ -1,4 +1,4 @@
-import argparse, os, sys, warnings
+import argparse, os, sys, warnings, shutil
 from pathlib import Path
 
 # sqlite shim for lamindb on some clusters
@@ -18,12 +18,11 @@ import torch
 
 LOCAL_DIR = Path("/tmp/zhanghy/lamindb").resolve()
 print(f"Using local instance directory: {LOCAL_DIR}")
-if not LOCAL_DIR.exists():
-    print("-> Initializing local anonymous instance...")
-    ln.setup.init(storage=str(LOCAL_DIR))
-else:
-    print("-> Local directory already exists, skipping init.")
-ln.connect("anonymous/lamindb")
+if LOCAL_DIR.exists():
+    shutil.rmtree(LOCAL_DIR)
+
+print("-> Initializing local anonymous instance...")
+ln.setup.init(storage=str(LOCAL_DIR), modules="bionty")
 print("\n✅ Connected successfully")
 print(f"lamindb version     : {ln.__version__}")
 print(f"lamindb-setup version: {lamindb_setup.__version__}")
@@ -349,6 +348,7 @@ except RuntimeError as e:
     if "not attached to a Trainer" in str(e):
         warnings.warn(str(e))
         edges_df = gn(ckpt, adata, cell_type=args.cell_type)
+        edges_df["ensembl_id"] = gn.var.index
     else:
         raise
 

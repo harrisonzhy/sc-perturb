@@ -46,6 +46,16 @@ def load_cfg_from_yaml(path: str):
     os.makedirs(cfg["output_dir"], exist_ok=True)
     return cfg
 
+def print_full_model(root: torch.nn.Module):
+    print("\n=== Model ===")
+    for module_name, module in root.named_modules():
+        indent = "  " * (module_name.count("."))
+        print(f"{indent}{module_name or '<root>'}  ({type(module).__name__})")
+
+        # Print parameters *directly owned by this module*
+        for param_name, param in module.named_parameters(recurse=False):
+            print(f"{indent}  └─ {param_name:20s} shape={tuple(param.shape)}  requires_grad={param.requires_grad}")
+
 # ----------------- GRN utils -----------------
 def load_grn_laplacian(
     csv_path: str,
@@ -59,12 +69,10 @@ def load_grn_laplacian(
     then build the Laplacian ONLY over the subset of genes that actually appear in
     at least one remaining edge (so isolated genes are not penalized).
     Returns:
-        (L, used_order)
+        (L, ordered_indices)
         - L: scipy.sparse.csr_matrix or None if no usable edges remain
-        - used_order: list[str] of genes corresponding to L's row/col order
+        - ordered_indices: list[int] of genes corresponding to L's row/col order
     """
-    import pandas as pd
-    from scipy import sparse
 
     df = pd.read_csv(csv_path)
     if not {"source", "target"}.issubset(df.columns):
@@ -77,35 +85,31 @@ def load_grn_laplacian(
     dst = df["target"].astype(str)
     w   = df["weight"].astype(np.float32).to_numpy()
 
-    # keep only edges fully inside gene_order
     gene_set = set(gene_order)
     mask = src.isin(gene_set) & dst.isin(gene_set)
-
     if not mask.any():
         print("[WARN] Nothing to penalize")
         return None, []
-
     src_kept = src[mask]
     dst_kept = dst[mask]
     w = w[mask.to_numpy()]
 
-    # subset of genes that actually appear in (src_kept, dst_kept), preserving gene_order order
     used_set = set(src_kept) | set(dst_kept)
     used_order = [g for g in gene_order if g in used_set]
+    ordered_indices = [i for i, g in enumerate(gene_order) if g in used_set]
 
     # map to compact indices
     gene_to_index = {g: i for i, g in enumerate(used_order)}
     iu = src_kept.map(gene_to_index).to_numpy(dtype=np.int64)
     iv = dst_kept.map(gene_to_index).to_numpy(dtype=np.int64)
-    n = len(used_order)
 
+    n = len(ordered_indices)
+    
     print(f"Laplacian has shape ({n}, {n})")
-
     if n == 0:
         return None, []
 
     # build COO then coalesce duplicates by summing
-    from scipy import sparse
     A = sparse.coo_matrix((w, (iu, iv)), shape=(n, n), dtype=np.float32).tocsr()
 
     # symmetrize
@@ -122,56 +126,175 @@ def load_grn_laplacian(
     L = sparse.eye(n, dtype=np.float32) - (Dinv @ A @ Dinv)
 
     print("Finished computing full Laplacian")
-    return L.tocsr(), used_order
+    return L.tocsr(), ordered_indices
 
 class GRNReg:
-    def __init__(self, module, L_csr, grn_lambda=1e-3, seed=0):
+    """
+    GRN-based regularizer for attention layers.
+
+    - L_csr: scipy.sparse CSR Laplacian, shape [n_genes, n_genes]
+    - gene_embed: torch.Tensor of shape [n_genes, in_dim]
+      giving a fixed embedding / feature vector for each gene.
+    """
+
+    def __init__(self, module, L_csr: sparse.csr_matrix,
+                ordered_indices, 
+                grn_lambda: float = 1e-3):
         self.module = module
         self.grn_lambda = float(grn_lambda)
-        idx = np.vstack(L_csr.nonzero()).astype(np.int64)
-        self.I = torch.tensor(idx)                              # [2, nnz]
-        self.V = torch.tensor(L_csr.data, dtype=torch.float32)  # [nnz]
-        self.shape = L_csr.shape
-        self._proj = None
-        self._seed = seed
 
-    def _P(self, device, in_dim, n_genes):
-        if self._proj is None or self._proj.shape != (in_dim, n_genes) or self._proj.device != device:
-            g = torch.Generator(device=device); g.manual_seed(self._seed)
-            self._proj = torch.randn(in_dim, n_genes, generator=g, device=device) / math.sqrt(in_dim)
-        return self._proj
+        # store Laplacian in COO form for PyTorch
+        row, col = L_csr.nonzero()
+        idx = np.vstack([row, col]).astype(np.int64)
+        self.I = torch.tensor(idx, dtype=torch.long)                 # [2, nnz]
+        self.V = torch.tensor(L_csr.data, dtype=torch.float32)       # [nnz]
+        self.shape = L_csr.shape                                     # (n_genes, n_genes)
 
-    def penalty(self, device):
-        if self.grn_lambda <= 0: 
+        # gene embeddings: [n_genes, in_dim]
+        W = module.basal_encoder.weight.detach()
+        self.gene_embed = W[:, ordered_indices].T.clone()
+        self.gene_embed.requires_grad_(False)
+        print(f"Gene embed weights shape: {self.gene_embed.shape}")
+
+    def _L(self, device):
+        return torch.sparse_coo_tensor(
+            self.I.to(device),
+            self.V.to(device),
+            self.shape,
+            device=device,
+        )
+
+    def penalty(self, device: torch.device):
+        if self.grn_lambda <= 0.0:
             return torch.tensor(0.0, device=device)
-        L = torch.sparse_coo_tensor(self.I.to(device), self.V.to(device), self.shape, device=device)
+
+        L = self._L(device)
+        E = self.gene_embed.to(device)   # [n_genes, in_dim]
+        n_genes, in_dim = E.shape
+
+        # sanity check: Laplacian and embeddings must agree on n_genes
+        if n_genes != self.shape[0]:
+            raise ValueError(
+                f"gene_embed has {n_genes} genes but Laplacian has {self.shape[0]}"
+            )
+
         total = torch.tensor(0.0, device=device)
+
         for m in self.module.modules():
             if hasattr(m, "q_proj") and hasattr(m, "k_proj"):
-                for W in (m.q_proj, m.k_proj):  # [out_dim, in_dim]
-                    P = self._P(device, W.weight.shape[1], self.shape[0])   # [in_dim, n_genes]
-                    F = P.T @ W.weight.T                                    # [n_genes, out_dim]
-                    LF = torch.sparse.mm(L, F)                               # [n_genes, out_dim]
-                    total = total + (F * LF).sum()
+                Wq = m.q_proj.weight      # [out_dim, in_dim]
+                Wk = m.k_proj.weight
+
+                if Wq.shape[1] != in_dim or Wk.shape[1] != in_dim:
+                    raise ValueError(
+                        f"in_dim mismatch: gene_embed has {in_dim}, "
+                        f"but q_proj/k_proj expect {Wq.shape[1]}"
+                    )
+
+                # per-gene queries / keys
+                Q = E @ Wq.T              # [n_genes, out_dim]
+                K = E @ Wk.T              # [n_genes, out_dim]
+
+                # Laplacian smoothness: tr(Q^T L Q) + tr(K^T L K)
+                LQ = torch.sparse.mm(L, Q)   # [n_genes, out_dim]
+                LK = torch.sparse.mm(L, K)
+
+                total = total + (Q * LQ).sum() + (K * LK).sum()
+
         return self.grn_lambda * total
 
 # -------------- fine-tune helpers --------------
-def freeze_all_but_attention(root: torch.nn.Module):
-    """Freeze everything except q/k/v/o in attention blocks."""
-    for p in root.parameters():
+import torch
+from torch import nn
+
+
+def freeze_all_but_last_n_layers(root: torch.nn.Module, n_layers: int):
+    """
+    Freeze all parameters except those in the last `n_layers`
+    transformer decoder blocks in `root.transformer_backbone.layers`.
+
+    Within each selected block, unfreeze:
+      - self_attn.{q_proj,k_proj,v_proj,o_proj}
+      - mlp (all params)
+      - norm modules inside the block (LlamaRMSNorm / LayerNorm)
+
+    Returns:
+        List[nn.Parameter]: the list of trainable parameters.
+    """
+    # 1) Freeze transformer backbone and basal encoder
+    for p in root.transformer_backbone.parameters():
         p.requires_grad = False
+    for p in root.basal_encoder.parameters():
+        p.requires_grad = False
+
+    # 2) Get the transformer layers explicitly
+    if not hasattr(root, "transformer_backbone"):
+        raise ValueError("Model has no attribute 'transformer_backbone'")
+
+    backbone = root.transformer_backbone
+
+    if not hasattr(backbone, "layers"):
+        raise ValueError("transformer_backbone has no attribute 'layers'")
+
+    blocks = list(backbone.layers)
+    if len(blocks) == 0:
+        print("[WARN] No transformer blocks found in transformer_backbone.layers")
+        return []
+
+    if n_layers <= 0:
+        print("[WARN] n_layers <= 0, all parameters remain frozen")
+        return []
+
+    # 3) Pick last n_layers blocks (clip if n_layers > #blocks)
+    n_layers = min(n_layers, len(blocks))
+    blocks_to_train = blocks[-n_layers:]
+
     trainable = []
-    for m in root.modules():
-        if hasattr(m, "q_proj") and hasattr(m, "k_proj") and hasattr(m, "v_proj"):
+
+    num_attn = 0
+    num_mlp = 0
+    num_norm = 0
+
+    for block in blocks_to_train:
+        # ---- attention projections ----
+        if hasattr(block, "self_attn"):
+            attn = block.self_attn
             for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                if hasattr(m, name):
-                    for p in getattr(m, name).parameters():
+                if hasattr(attn, name):
+                    mod = getattr(attn, name)
+                    for p in mod.parameters():
                         p.requires_grad = True
                         trainable.append(p)
+                        num_attn += 1
+
+        # ---- MLP / feed-forward ----
+        if hasattr(block, "mlp"):
+            for p in block.mlp.parameters():
+                p.requires_grad = True
+                trainable.append(p)
+                num_mlp += 1
+
+        # ---- Norms inside the block (RMSNorm / LayerNorm) ----
+        for sub in block.modules():
+            cls_name = sub.__class__.__name__
+            if isinstance(sub, torch.nn.LayerNorm) or cls_name in ("LlamaRMSNorm", "RMSNorm"):
+                for p in sub.parameters():
+                    p.requires_grad = True
+                    trainable.append(p)
+                    num_norm += 1
+    
+    for p in root.basal_encoder.parameters():
+        p.requires_grad = False
+
+    print("Trainable parameter counts:")
+    print(f"Attention: {num_attn}, MLP: {num_mlp}, Norm: {num_norm}")
+
+    if not trainable:
+        print("[WARN] No trainable parameters found in selected blocks")
+    
     return trainable
 
-
-# -------------- main training flow (mirrors _train.py, then adds our GRN/attention changes) --------------
+# -------------- run training --------------
 def run(cfg: DictConfig):
     import json
     import logging
@@ -199,7 +322,6 @@ def run(cfg: DictConfig):
     with open(join(run_output_dir, "config.yaml"), "w") as f:
         f.write(cfg_yaml)
 
-    # --- seed ---
     pl.seed_everything(cfg["training"]["train_seed"])
 
     # --- special case param hacks (kept from _train.py style) ---
@@ -367,87 +489,30 @@ def run(cfg: DictConfig):
         print(f"Loaded checkpoint with shape filtering: missing={len(missing)}, unexpected={len(unexpected)}")
         ckpt_path = None  # start training fresh from the loaded weights
 
-    # ------------------- our modifications: freeze attention + GRN penalty -------------------
-    trainable = freeze_all_but_attention(model)
-    print(f"Trainable attention params: {sum(p.numel() for p in trainable):,}")
+    # ------------------- freeze last n layers + GRN loss -------------------
+    trainable = freeze_all_but_last_n_layers(root=model, n_layers=2)
+    print(f"Trainable params: {sum(p.numel() for p in trainable):,}")
+    print_full_model(root=model)
 
     import re, mygene
    
     def gene_to_ensembl(gene_ids, species="human", batch_size=1000, progress=True):
-        """
-        Map a list of gene symbols to Ensembl gene IDs using MyGeneInfo.
-
-        Returns:
-            ens_list: list[str | None]  # same length as gene_ids, unmapped = None
-            mapped_idx: list[int]       # indices of successfully mapped genes
-        """
-        mg = mygene.MyGeneInfo()
-        cleaned = [str(g) for g in gene_ids]
-
-        pbar = tqdm(total=len(cleaned), desc="Querying MyGeneInfo", unit="gene") if progress else None
-        results = []
-
-        # Batch queries
-        for i in range(0, len(cleaned), batch_size):
-            batch = cleaned[i : i + batch_size]
-            hits = mg.querymany(
-                batch,
-                scopes="symbol,alias,old_symbol,entrezgene",
-                fields="ensembl.gene",
-                species=species,
-                as_dataframe=False
-            )
-            results.extend(hits or [])
-            if pbar:
-                pbar.update(len(batch))
-
-        if pbar:
-            pbar.close()
-
-        # Group results by query string
-        grouped = {}
-        for h in results:
-            q = h.get("query")
-            if q is not None:
-                grouped.setdefault(q, []).append(h)
-
-        def extract_ensembl_id(h):
-            e = h.get("ensembl")
-            if isinstance(e, list) and e:
-                return e[0].get("gene")
-            if isinstance(e, dict):
-                return e.get("gene")
-            return None
-
-        ens_list = []
-        mapped_idx = []
-
-        # Build outputs
-        for i, g in enumerate(cleaned):
-            rows = grouped.get(g, [])
-            eid = None
-            for r in rows:
-                eid = extract_ensembl_id(r)
-                if eid:
-                    break
-            ens_list.append(eid)
-            if eid:
-                mapped_idx.append(i)
-
-        return ens_list, mapped_idx
-
+        with open("grn_out/symbols_dict.pkl", "rb") as f:
+            symbols_map = pickle.load(f)
+        return [symbols_map.get(gid) for gid in gene_ids] 
+        
     if "grn" in cfg and cfg["grn"].get("path"):
-        ens_list, mapped_idx = gene_to_ensembl(data_module.get_var_names())
-        ens_mapped = [ens_list[i] for i in mapped_idx]
+        ens_list = gene_to_ensembl(data_module.get_var_names())
         print("Load GRN and compute Laplacian")
-        L, used_order = load_grn_laplacian(csv_path=cfg["grn"]["path"], gene_order=ens_mapped)
+        L, ordered_indices = load_grn_laplacian(csv_path=cfg["grn"]["path"], gene_order=ens_list)
         print("Load GRN regularizer")
-        grn_reg = GRNReg(model, L, grn_lambda=float(cfg["grn"].get("lambda", 1e-3)))
+        grn_reg = GRNReg(model, L, grn_lambda=float(cfg["grn"].get("lambda", 1e-3)), ordered_indices=ordered_indices)
     else:
+        print("[WARN] No GRN regularizer found")
         grn_reg = None
 
-    print("Set up training")
     # Wrap training_step to add GRN term
+    print("Set up training")
     orig_training_step = model.training_step
     def training_step_with_grn(*args, **kwargs):
         out = orig_training_step(*args, **kwargs)
@@ -462,7 +527,7 @@ def run(cfg: DictConfig):
         return out
     model.training_step = training_step_with_grn
 
-    # Optimizer on attention-only params
+    # Optimizer on trainable params
     params = [p for p in model.parameters() if p.requires_grad]
     lr = cfg["model"]["kwargs"].get("lr", cfg["training"].get("lr", 2e-5))
     optimizer = torch.optim.AdamW(params, lr=lr, betas=(0.9, 0.98), weight_decay=cfg["training"].get("weight_decay", 0.01))
@@ -481,7 +546,7 @@ def run(cfg: DictConfig):
 
 
 def main():
-    parser = ap.ArgumentParser("Attention-only fine-tuning with GRN prior (integrated with _train.py logic)")
+    parser = ap.ArgumentParser("Fine-tuning with GRN prior")
     parser.add_argument("--hparams", default="./finetune.yaml", help="Path to YAML hparams file")
     parser.add_argument("hydra_overrides", nargs="*", help="Hydra-style overrides")
     args = parser.parse_args()

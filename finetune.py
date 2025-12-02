@@ -406,6 +406,7 @@ def run(cfg: DictConfig):
 
     # ------------------- checkpoint load -------------------
     manual_init = cfg["model"]["kwargs"]["transformer_backbone_kwargs"].get("init_from", None)
+    print("Load checkpoint from:", manual_init)
     checkpoint = torch.load(manual_init, map_location="cpu", weights_only=False)
     model.load_state_dict(checkpoint["state_dict"], strict=True)
 

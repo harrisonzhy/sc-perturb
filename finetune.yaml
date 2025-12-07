@@ -77,22 +77,22 @@ model:
       rotary_dim: 0
       use_rotary_embeddings: false
       init_from: "/home/zhanghy/orcd/scratch/zhanghy/sc-perturb/competition/first_run/checkpoints/step=8800.ckpt"
-
+      #init_from: "/home/zhanghy/orcd/scratch/zhanghy/sc-perturb/ft-improved-1200-new/ft_attn_grn/checkpoints/step=1400.ckpt"
 training:
   batch_size: 1
   lr: 2e-5
   weight_decay: 0.01
-  max_steps: 1000
-  val_freq: 50
+  max_steps: 2000
+  val_freq: 100
   train_seed: 1337
   gradient_clip_val: 1.0
   devices: 1
   strategy: auto
-  log_every_n_steps: 50
+  log_every_n_steps: 100
   use_mfu: false
   cumulative_flops_use_backward: false
   ckpt_every_n_steps: 100
 
 grn:
   path: "/home/zhanghy/orcd/scratch/zhanghy/sc-perturb/grn_out2/edges_all.csv"
-  lambda: 1.0e-3
+  lambda: 1.0e-4

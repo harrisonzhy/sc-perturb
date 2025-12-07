@@ -176,7 +176,7 @@ def grn_decoder_smoothness_loss(
     decoder_weight: torch.Tensor,
     edge_index: torch.Tensor,
     edge_weight: torch.Tensor,
-    max_edges: int = 10_000,
+    max_edges: int = 100_000,
     chunk_size: int = 10_000,
 ) -> torch.Tensor:
     """
@@ -521,6 +521,17 @@ def run(cfg: DictConfig):
     print("Set up training with decoder GRN prior (if available)")
 
     orig_training_step = model.training_step
+    
+    for m in model.modules():
+        if isinstance(m, torch.nn.Linear) and m.out_features == decoder_out_dim:
+            decoder_init_weight = m.weight
+    if decoder_init_weight is None:
+        raise RuntimeError(
+            "Could not find decoder Linear with out_features == "
+            f"{decoder_out_dim}. Adjust the search logic if needed."
+        )
+    decoder_init_weight = decoder_init_weight.detach().clone()
+
     def training_step_with_grn(*args, **kwargs):
         out = orig_training_step(*args, **kwargs)
 
@@ -529,6 +540,8 @@ def run(cfg: DictConfig):
             base_loss = out["loss"]
         else:
             base_loss = out
+
+        return base_loss
 
         if grn_edge_index is not None and grn_lambda > 0.0:
             device = next(model.parameters()).device
@@ -550,7 +563,10 @@ def run(cfg: DictConfig):
                 edge_weight=grn_edge_weight.to(device),
             )
 
-            total_loss = base_loss + grn_lambda * reg
+            prox = ((decoder_weight.to(device) - decoder_init_weight.to(decoder_weight.device)) ** 2).sum()
+            mu = 1.0e-4
+            total_loss = base_loss + grn_lambda * reg + mu * prox
+            # total_loss = base_loss + grn_lambda * reg
 
             # log the regularizer
             model.log(
@@ -562,6 +578,8 @@ def run(cfg: DictConfig):
             )
         else:
             total_loss = base_loss
+
+        model.log("total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True)
 
         if isinstance(out, dict):
             out["loss"] = total_loss

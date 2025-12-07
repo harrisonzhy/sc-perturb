@@ -541,8 +541,6 @@ def run(cfg: DictConfig):
         else:
             base_loss = out
 
-        return base_loss
-
         if grn_edge_index is not None and grn_lambda > 0.0:
             device = next(model.parameters()).device
 

@@ -17,7 +17,7 @@ uv run state tx infer \
 --output "../competition/prediction.h5ad" \
 --model-dir "../competition/first_run" \
 --checkpoint "../competition/first_run/checkpoints/step=8800.ckpt" \
---adata "../competition_support_set/competition_val_template.h5ad" \ 
+--adata "../competition_support_set/competition_train_split_val.h5ad" \ 
 --pert-col "target_gene"
 ```
 To visualize the output h5ad file, run `visualize.py`:
@@ -40,28 +40,22 @@ rsync -avP zhanghy@orcd-login003.mit.edu:/orcd/home/002/zhanghy/orcd/scratch/zha
 ```
 
 ### Evaluation
-Run evaluation, e.g. for the fine-tuned model for 300 iterations, by first running inference to generate predictions:
+Run evaluation for the fine-tuned model by running inference to generate predictions:
 ```
 uv run --active state tx infer \
   --output "/home/zhanghy/orcd/scratch/zhanghy/sc-perturb/ft-out/prediction.h5ad" \
   --model-dir "/home/zhanghy/orcd/scratch/zhanghy/sc-perturb/ft-out/ft_attn_grn" \
   --checkpoint "/home/zhanghy/orcd/scratch/zhanghy/sc-perturb/ft-out/ft_attn_grn/checkpoints/step=200.ckpt" \
-  --adata "/home/zhanghy/orcd/scratch/zhanghy/sc-perturb/competition_support_set/competition_val_template.h5ad" \
+  --adata "/home/zhanghy/orcd/scratch/zhanghy/sc-perturb/competition_support_set/competition_train_split_val.h5ad" \
   --pert-col target_gene
 ```
-Then package results into a `vcc` file:
-```
-uv tool run cell-eval prep \
-  -i ft-out/prediction.h5ad \
-  -g /home/zhanghy/orcd/scratch/zhanghy/sc-perturb/competition_support_set/gene_names.csv \
-  -o ft-out/prediction.prep.vcc
-```
-Then, run scoring locally:
+Then, run scoring to obtain evaluation metrics:
 ```
 uv tool run cell-eval run \
-  --num-threads 16 \
+  --num-threads 8 \
+  --de-real competition_support_set/real_de_new.csv \
   --adata-pred ft-out/prediction.h5ad \
-  --adata-real /home/zhanghy/orcd/scratch/zhanghy/sc-perturb/competition_support_set/competition_val_template.h5ad \
+  --adata-real /home/zhanghy/orcd/scratch/zhanghy/sc-perturb/competition_support_set/competition_train_split_val.h5ad \
   --de-real ft-v1/H1_real_de.csv \
   --control-pert non-targeting \
   --pert-col target_gene \

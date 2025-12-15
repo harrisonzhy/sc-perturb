@@ -76,8 +76,7 @@ model:
       tie_word_embeddings: false
       rotary_dim: 0
       use_rotary_embeddings: false
-      init_from: "/home/zhanghy/orcd/scratch/zhanghy/sc-perturb/competition/first_run/checkpoints/step=8800.ckpt"
-      #init_from: "/home/zhanghy/orcd/scratch/zhanghy/sc-perturb/ft-improved-1200-new/ft_attn_grn/checkpoints/step=1400.ckpt"
+      init_from: "/home/zhanghy/orcd/scratch/zhanghy/sc-perturb/run_with_new_data/checkpoints/step=8000.ckpt"
 training:
   batch_size: 1
   lr: 2e-5

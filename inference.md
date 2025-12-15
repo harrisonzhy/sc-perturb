@@ -1,7 +1,7 @@
 ### GRN inference
 To run scPRINT GRN inference, you must first download the model from HuggingFace:
 ```
-python3 download_model.py
+python3 download_sc_model.py
 ```
 Next, you must also have an active `lamindb` instance. The script below should set it up automatically:
 ```
